@@ -1,0 +1,359 @@
+{
+  "name": "AI Lead Triage & Auto-Reply",
+  "nodes": [
+    {
+      "id": "1",
+      "name": "Lead Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "responseMode": "responseNode"
+      }
+    },
+    {
+      "id": "2",
+      "name": "Normalize & Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// Source of truth for the \"Normalize & Score\" Code node. Copied into the workflow JSON by build_workflow.py.\nconst b = $input.first().json.body || $input.first().json;\nconst msg = String(b.message || '').trim();\nconst email = String(b.email || '').trim().toLowerCase();\nconst phone = String(b.phone || '').trim();\nconst urgent = /\\b(asap|urgent|emergency|today|leak|burst|no heat|no ac|storm|flood)\\b/i.test(msg);\nconst budget = /\\b(quote|estimate|price|cost|budget|replace|install)\\b/i.test(msg);\nconst spam = /\\b(seo services|backlinks|crypto|casino|viagra|loan offer)\\b/i.test(msg) || !/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(email);\nlet score = 0;\nif (urgent) score += 40;\nif (budget) score += 20;\nif (phone) score += 15;\nif (msg.length > 60) score += 15;\nif (b.service) score += 10;\nif (spam) score = 0;\nconst tier = spam ? 'SPAM' : score >= 60 ? 'HOT' : score >= 30 ? 'WARM' : 'COLD';\nreturn [{ json: { name: b.name || 'there', email, phone, service: b.service || '', message: msg, score, tier, urgent, spam, receivedAt: new Date().toISOString() } }];\n"
+      }
+    },
+    {
+      "id": "3",
+      "name": "Is Spam?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        440,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.spam }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "4",
+      "name": "AI Draft Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OPENAI_BASE_URL || 'https://api.openai.com/v1') + '/chat/completions' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OPENAI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({model: $env.OPENAI_MODEL || 'gpt-4o-mini', max_tokens: 200, messages: [{role: 'system', content: 'You write short, warm, professional replies for a local service business. Never promise prices or exact times. Max 80 words.'}, {role: 'user', content: 'Customer: ' + $json.name + '\\nService: ' + $json.service + '\\nMessage: ' + $json.message + '\\nUrgent: ' + $json.urgent}]}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "5",
+      "name": "Build Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const lead = $('Normalize & Score').first().json;\nlet reply;\ntry { reply = $json.choices[0].message.content.trim(); } catch (e) { reply = null; }\nif (!reply) reply = `Hi ${lead.name}, thanks for contacting ${$env.BUSINESS_NAME || 'us'}. We received your request and will get back to you shortly.`;\nreturn [{ json: { ...lead, reply } }];"
+      }
+    },
+    {
+      "id": "6",
+      "name": "Send Reply to Lead",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1120,
+        300
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $json.email }}",
+        "subject": "={{ 'Re: your enquiry - ' + ($env.BUSINESS_NAME || 'We got your message') }}",
+        "message": "={{ $json.reply }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "7",
+      "name": "Is HOT?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $('Build Email').item.json.tier }}",
+              "rightValue": "HOT",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "8",
+      "name": "Alert Owner (HOT)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1560,
+        200
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $env.OWNER_ALERT_EMAIL }}",
+        "subject": "={{ 'HOT lead: ' + $('Build Email').item.json.name }}",
+        "message": "={{ 'Score ' + $('Build Email').item.json.score + '\\nPhone: ' + $('Build Email').item.json.phone + '\\n\\n' + $('Build Email').item.json.message }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "9",
+      "name": "Log to Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1780,
+        300
+      ],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.GOOGLE_SHEET_ID }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Leads"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Received": "={{ $('Build Email').item.json.receivedAt }}",
+            "Name": "={{ $('Build Email').item.json.name }}",
+            "Email": "={{ $('Build Email').item.json.email }}",
+            "Phone": "={{ $('Build Email').item.json.phone }}",
+            "Tier": "={{ $('Build Email').item.json.tier }}",
+            "Score": "={{ $('Build Email').item.json.score }}",
+            "Message": "={{ $('Build Email').item.json.message }}"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "10",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2000,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, tier: $('Build Email').item.json.tier } }}"
+      }
+    },
+    {
+      "id": "11",
+      "name": "Respond Spam",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        680,
+        100
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true } }}"
+      }
+    }
+  ],
+  "connections": {
+    "Lead Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Score": {
+      "main": [
+        [
+          {
+            "node": "Is Spam?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Spam?": {
+      "main": [
+        [
+          {
+            "node": "Respond Spam",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Draft Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Draft Reply": {
+      "main": [
+        [
+          {
+            "node": "Build Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Email": {
+      "main": [
+        [
+          {
+            "node": "Send Reply to Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reply to Lead": {
+      "main": [
+        [
+          {
+            "node": "Is HOT?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is HOT?": {
+      "main": [
+        [
+          {
+            "node": "Alert Owner (HOT)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log to Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Owner (HOT)": {
+      "main": [
+        [
+          {
+            "node": "Log to Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Google Sheet": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
